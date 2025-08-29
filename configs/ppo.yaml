@@ -1,0 +1,20 @@
+# configs/ppo.yaml
+inherit: "configs/base.yaml"
+learning_rate: 1e-5
+ppo_epochs: 4
+target_kl: 0.03
+kl_alpha: 0.01
+vf_coef: 1.0
+ent_coef: 0.01
+clip_range: 0.2
+
+# 生成相关
+max_new_tokens: 32 
+grad_accum: 16
+
+
+dev_eval:
+  enabled: true
+  path: "data/qa_eval.jsonl"   # point to your qa_eval.jsonl (optional)
+  num_examples: 8              # <= size of that eval file; will still be capped in code
+  top_p: 0.0                   # greedy by default (set 0 or omit)

@@ -1,0 +1,11 @@
+inherit: "configs/base.yaml"
+
+learning_rate: 1e-5
+total_steps: 300
+
+reward:
+  type: "semantic"   # or "judge"/"mix"
+
+kl_penalty:
+  alpha: 0.02        # raise to keep policy closer; lower to let it drift
+  type: "token"      # "token" (fast) or "forward" (exact, slower)
