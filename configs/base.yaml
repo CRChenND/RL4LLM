@@ -17,7 +17,7 @@ top_p: 0.9
 
 output_dir: "outputs"
 log_every: 1
-save_every: 100
+save_every: 50
 
 dataset:
   path: "data/qa_train.jsonl"
