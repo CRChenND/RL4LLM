@@ -153,8 +153,11 @@ def compute_logprobs_and_values(policy, value_head, input_ids):
 class ValueHead(nn.Module):
     def __init__(self, hidden_size: int):
         super().__init__()
-        self.v = nn.Linear(hidden_size, 1)
-        nn.init.zeros_(self.v.bias)
+        self.v = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
     def forward(self, hidden_states):
         return self.v(hidden_states).squeeze(-1)
 
@@ -182,18 +185,23 @@ def ppo_minibatches(total_size, mb_size, generator=None):
 def compute_gae(rewards, values, masks, gamma, lam):
     """
     rewards, values, masks: [N, T]
-    returns, advantages are zero where mask==0
+    Returns:
+      returns, advantages: [N, T] (zeros where mask==0)
     """
     N, T = values.shape
     adv = torch.zeros_like(values)
     lastgaelam = torch.zeros(N, device=values.device)
     for t in reversed(range(T)):
-        mask_t = masks[:, t]
-        next_values = values[:, t+1] if t+1 < T else torch.zeros_like(values[:, t])
-        delta = rewards[:, t] + gamma * next_values - values[:, t]
-        delta = delta * mask_t
-        lastgaelam = (delta + gamma * lam * lastgaelam) * mask_t
-        adv[:, t] = lastgaelam
+        mask_t = masks[:, t] # 1 if this token is valid
+        if t + 1 < T:
+            next_values = values[:, t+1]
+            mask_next = masks[:, t+1]     # 1 if next token is valid
+        else:
+            next_values = torch.zeros_like(values[:, t])
+            mask_next = torch.zeros_like(mask_t)
+        delta = (rewards[:, t] + gamma * next_values - values[:, t]) * mask_t
+        lastgaelam = delta + gamma * lam * lastgaelam * mask_next
+        adv[:, t] = lastgaelam * mask_t
     returns = adv + values
     return returns, adv
 
@@ -273,7 +281,7 @@ def main(config_path: str):
     value_head = ValueHead(hidden_size).to(device)
     optimizer = torch.optim.AdamW([
         {"params": [p for p in policy.parameters() if p.requires_grad], "lr": lr},
-        {"params": value_head.parameters(), "lr": lr * 5.0},
+        {"params": value_head.parameters(), "lr": lr * 10.0},
     ])
 
     huber = torch.nn.SmoothL1Loss(beta=1.0, reduction='mean')
@@ -331,7 +339,12 @@ def main(config_path: str):
         for i in range(N):
             L = int(cont_len[i].item())
             if L > 0:
-                rewards_matrix[i, -L:][-1] = rewards_t[i]
+                rewards_matrix[i, -L:] = rewards_t[i]/L  # evenly spread to continuation tokens
+
+        # === scale reward ===
+        scale = float(cfg.get("reward_scale", 1.0))
+        if scale != 1.0:
+            rewards_matrix = rewards_matrix * scale
 
         # -------- GAE (returns & advantages)
         returns, adv = compute_gae(rewards_matrix, values, masks, ppo_cfg.gamma, ppo_cfg.lam)
@@ -382,6 +395,10 @@ def main(config_path: str):
             kl_coef = base_alpha * scale
             kl_coef_float = float(kl_coef)
 
+            local_clip = ppo_cfg.clip_range
+            if   kl_tok_mean_epoch > ppo_cfg.target_kl * 2.0:  local_clip = min(local_clip, 0.12)
+            elif kl_tok_mean_epoch > ppo_cfg.target_kl * 1.5:  local_clip = min(local_clip, 0.15)
+
         # -------- PPO optimization epochs
         for _ in range(ppo_cfg.ppo_epochs):
             for idx in ppo_minibatches(token_count, mb_size, generator=rng_cpu):
@@ -397,7 +414,8 @@ def main(config_path: str):
                 # PPO policy loss
                 ratio = torch.exp(new_lp - old_logp_flat[idx])
                 unclipped = ratio * adv_flat[idx]
-                clipped = torch.clamp(ratio, 1.0 - ppo_cfg.clip_range, 1.0 + ppo_cfg.clip_range) * adv_flat[idx]
+                # clipped = torch.clamp(ratio, 1.0 - ppo_cfg.clip_range, 1.0 + ppo_cfg.clip_range) * adv_flat[idx]
+                clipped = torch.clamp(ratio, 1.0 - local_clip, 1.0 + local_clip) * adv_flat[idx]
                 loss_pg = -torch.mean(torch.min(unclipped, clipped))
                 clip_frac = torch.mean((torch.abs(ratio - 1.0) > ppo_cfg.clip_range).float())
 
@@ -560,14 +578,20 @@ def main(config_path: str):
         with jsonl_writer(metrics_path) as f:
             f.write(json.dumps(record) + "\n")
 
-        # ---- adaptive α across steps (nudges toward target_kl)
-        # use post-update KLdist mean
+        # ---- adaptive α across steps (smooth, with floor + warmup)
         kl_post = float(tmean(KLdist_seq))
+        alpha_min = float(cfg.get("kl_alpha_min", 1e-2))   
+        alpha_max = float(cfg.get("kl_alpha_max", 1.0))    
+        beta      = float(cfg.get("kl_beta", 0.7))         
+        warmup    = int(cfg.get("kl_warmup_steps", 5))    
         if np.isfinite(kl_post):
-            hi, lo = 1.5 * ppo_cfg.target_kl, 0.5 * ppo_cfg.target_kl
-            if kl_post > hi:      base_alpha *= 1.5
-            elif kl_post < lo:    base_alpha /= 1.5
-            base_alpha = float(np.clip(base_alpha, 1e-4, 1.0))
+            if step >= warmup:
+                # alpha *= exp(beta * (KL/target - 1))
+                ratio = max(kl_post / ppo_cfg.target_kl, 1e-6)
+                base_alpha *= float(np.exp(beta * (ratio - 1.0)))
+                base_alpha = float(np.clip(base_alpha, alpha_min, alpha_max))
+            else:
+                base_alpha = max(base_alpha, alpha_min)
 
         # periodic save
         if step % int(cfg.get("save_every", 100)) == 0 and step > 0:
