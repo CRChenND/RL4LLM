@@ -42,7 +42,7 @@ regex==2025.7.34
 requests==2.32.5
 safetensors==0.6.2
 scikit-learn==1.7.1
-scipy==1.11.4
+scipy==1.14.1
 sentence-transformers==5.1.0
 sentencepiece==0.2.1
 six==1.17.0
