@@ -22,8 +22,8 @@ log_every: 10
 save_every: 50
 
 dataset:
-  path: "data/train/qa_train_clean.jsonl"
-  eval_path: "data/train/qa_eval_clean.jsonl"
+  path: "data/train/qa_train_clean_wc.jsonl"
+  eval_path: "data/train/qa_eval_clean_wc.jsonl"
   template: "You are given a context and a question. Answer concisely using only information supported by the context. Answer with a single word or short phrase, no extra options or explanations.\n\nQ: {prompt}\nA:"
   max_samples: null
 
