@@ -107,32 +107,102 @@ def bootstrap_mean_ci(x: List[float], iters: int = 10000, seed: int = 7, ci: flo
     lo = boots[int((1-ci)/2*(iters-1))]; hi = boots[int((1+(ci))/2*(iters-1))]
     return sum(boots)/iters, (lo, hi)
 
+# def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: str) -> Tuple[float, float, int]:
+#     """Return (sum_logprob, avg_logprob, cont_len_tokens) for the canary only."""
+#     full_text = prompt + continuation
+#     enc_full = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
+#     input_ids = enc_full["input_ids"].to(device)
+#     attn = enc_full.get("attention_mask", None)
+#     if attn is not None: attn = attn.to(device)
+
+#     enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+#     prompt_len = enc_prompt["input_ids"].shape[1]
+
+#     with torch.no_grad():
+#         out = model(input_ids=input_ids, attention_mask=attn)
+#         logits = out.logits[:, :-1, :].float()       # [1, T-1, V]
+#         targets = input_ids[:, 1:]                   # [1, T-1]
+#         log_probs = F.log_softmax(logits, dim=-1)    # [1, T-1, V]
+#         token_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [1, T-1]
+
+#     if prompt_len - 1 >= token_lp.shape[1]:
+#         return float("-inf"), float("-inf"), 0
+
+#     cont_lp = token_lp[0, prompt_len-1:].tolist()
+#     s = float(sum(cont_lp))
+#     L = len(cont_lp)
+#     a = s / max(1, L)
+#     return s, a, L
+
 def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: str) -> Tuple[float, float, int]:
-    """Return (sum_logprob, avg_logprob, cont_len_tokens) for the canary only."""
-    full_text = prompt + continuation
-    enc_full = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
-    input_ids = enc_full["input_ids"].to(device)
-    attn = enc_full.get("attention_mask", None)
-    if attn is not None: attn = attn.to(device)
+    """
+    只对 continuation (canary) 段计算对数似然：
+    - 用 labels 掩码屏蔽 prompt 段（labels 置 -100）
+    - 让模型自己对齐（含 BOS/EOS 等），避免手工切片误差
+    返回: (sum_logprob, avg_logprob, cont_len_tokens)
+    """
+    import torch
+    import torch.nn.functional as F
 
+    # 先分别分词（不加 special tokens，得到精准 token 数）
     enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-    prompt_len = enc_prompt["input_ids"].shape[1]
+    enc_canary = tokenizer(continuation, return_tensors="pt", add_special_tokens=False)
 
-    with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=attn)
-        logits = out.logits[:, :-1, :].float()       # [1, T-1, V]
-        targets = input_ids[:, 1:]                   # [1, T-1]
-        log_probs = F.log_softmax(logits, dim=-1)    # [1, T-1, V]
-        token_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [1, T-1]
-
-    if prompt_len - 1 >= token_lp.shape[1]:
+    prompt_ids = enc_prompt["input_ids"]
+    canary_ids = enc_canary["input_ids"]
+    Lc = canary_ids.shape[1]
+    if Lc == 0:
         return float("-inf"), float("-inf"), 0
 
-    cont_lp = token_lp[0, prompt_len-1:].tolist()
-    s = float(sum(cont_lp))
-    L = len(cont_lp)
-    a = s / max(1, L)
-    return s, a, L
+    # 让模型按自己的方式加特殊符号：把“拼接文本”一次性编码（允许 special tokens）
+    enc_full = tokenizer(
+        prompt + continuation,
+        return_tensors="pt",
+        add_special_tokens=True,      # 交给模型/分词器处理BOS/EOS等
+        padding=False,
+        truncation=False,
+    )
+    input_ids = enc_full["input_ids"].to(device)
+    attn = enc_full.get("attention_mask", None)
+    if attn is not None:
+        attn = attn.to(device)
+
+    # 构造 labels：与 input_ids 等长；prompt 段置 -100，canary 段保留 label
+    # 关键：需要知道“canary 在 enc_full 中的 token 数”；我们用 enc_canary 的长度 Lc。
+    # enc_full 的交错前缀长度不直接可见，但“总长度- Lc”就是 canary 起始位置的上一 token。
+    T = input_ids.shape[1]
+    if Lc >= T:
+        return float("-inf"), float("-inf"), 0
+
+    labels = input_ids.clone()
+    # 屏蔽掉除了最后 Lc 个 token 以外的全部 label
+    labels[:, : T - Lc] = -100
+
+    with torch.no_grad():
+        out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+        # transformers 的 CausalLM 会返回 loss；我们要逐 token loss 来取对数似然
+        logits = out.logits  # [1, T, V]
+        V = logits.shape[-1]
+        # 计算逐 token 交叉熵（忽略 label=-100 的位置）
+        per_token_nll = F.cross_entropy(
+            logits.view(-1, V),
+            labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view(1, T)
+
+    # 只取 canary 段（labels != -100）的 nll，转成 logprob = -nll
+    canary_mask = (labels != -100).float()
+    # 若由于特殊tokens导致有效 canary 个数与 Lc 不等，这里以 mask 实际计数为准
+    eff_L = int(canary_mask.sum().item())
+    if eff_L == 0:
+        return float("-inf"), float("-inf"), 0
+
+    canary_nll = (per_token_nll * canary_mask).sum().item()
+    s = -float(canary_nll)
+    a = s / eff_L
+    return s, a, eff_L
+
 
 # ------------------------------
 # Core: canary-only evaluation
@@ -585,7 +655,7 @@ if __name__ == "__main__":
 #   --data data/infer/infer_seen.jsonl \
 #   --data data/infer/infer_unseen.jsonl \
 #   --data data/infer/infer_control.jsonl \
-#   --outdir outputs/eval_out_4b \
+#   --outdir outputs/eval_out_simple \
 #   --by_bucket_sig
 
 
