@@ -1,5 +1,5 @@
 model_id: "google/gemma-3-4b-it"
-dtype: "float32"
+dtype: "bfloat16" #"float32"
 device: "cuda"
 seed: 42
 
