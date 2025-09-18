@@ -110,12 +110,12 @@ def bootstrap_mean_ci(x: List[float], iters: int = 10000, seed: int = 7, ci: flo
 def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: str) -> Tuple[float, float, int]:
     """Return (sum_logprob, avg_logprob, cont_len_tokens) for the canary only."""
     full_text = prompt + continuation
-    enc_full = tokenizer(full_text, return_tensors="pt")
+    enc_full = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
     input_ids = enc_full["input_ids"].to(device)
     attn = enc_full.get("attention_mask", None)
     if attn is not None: attn = attn.to(device)
 
-    enc_prompt = tokenizer(prompt, return_tensors="pt")
+    enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     prompt_len = enc_prompt["input_ids"].shape[1]
 
     with torch.no_grad():
@@ -290,7 +290,7 @@ def diff_in_diff(rows, run_with="with", run_without="without",
 
     def _boot_mean_diff(a, b, it=iters, sd=seed):
         rng = random.Random(sd)
-        if not a or not b: return float("nan"), (float("nan"), float("nan"))
+        if not a or not b: return float("nan"), (float("nan"), float("nan")), []
         nA, nB = len(a), len(b); boots=[]
         for _ in range(it):
             ma = sum(a[rng.randrange(nA)] for _ in range(nA))/nA
@@ -578,14 +578,14 @@ if __name__ == "__main__":
     main()
 
 # python tools/batch_eval_canary_simple.py \
-#   --model_id google/gemma-3-270m-it \
-#   --run with=outputs/reinforce-simple-20250916-234435/step-250/adapter_model.safetensors \
-#   --run without=outputs/reinforce-simple-20250916-223308/step-100/adapter_model.safetensors \
-#   --run baseline=None \
-#   --data data/infer_seen.jsonl \
-#   --data data/infer_unseen.jsonl \
-#   --data data/infer_control.jsonl \
-#   --outdir outputs/eval_out_simple \
+#   --model_id google/gemma-3-4b-it \
+#   --run with=outputs/reinforce-simple-20250918-224643/step-250/adapter_model.safetensors \
+#   --run without=outputs/reinforce-simple-20250918-220932/step-150/adapter_model.safetensors \
+#   --run baseline=none \
+#   --data data/infer/infer_seen.jsonl \
+#   --data data/infer/infer_unseen.jsonl \
+#   --data data/infer/infer_control.jsonl \
+#   --outdir outputs/eval_out_4b \
 #   --by_bucket_sig
 
 
