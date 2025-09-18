@@ -1,80 +1,115 @@
-import os, json, hashlib, pathlib
-import torch, torch.nn.functional as F
-from typing import List, Dict, Any
-from sentence_transformers import SentenceTransformer
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
-def _hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+import os, json, hashlib, time
+from typing import List, Dict, Any, Optional
+
+import torch
+import torch.nn.functional as F
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
+EMPTY_BASELINE = 0.5710
+
+def tlog(msg):
+    print(f"[TLOG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def _hash16(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:16]
 
 class EmbCache:
-    def __init__(self, path: str|None):
+    def __init__(self, path: Optional[str]):
         self.path = path
-        self.mem: Dict[str, list[float]] = {}
+        self.mem: Dict[str, List[float]] = {}
         if path and os.path.exists(path):
-            with open(path) as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         rec = json.loads(line)
-                        self.mem[rec["k"]] = rec["v"]
+                        k, v = rec.get("k"), rec.get("v")
+                        if isinstance(k, str) and isinstance(v, list):
+                            self.mem[k] = v
                     except Exception:
                         pass
 
-    def get(self, k: str): return self.mem.get(k)
-    def put(self, k: str, v: list[float]):
+    def get(self, k: str):
+        return self.mem.get(k)
+
+    def put(self, k: str, v: List[float]):
+        if k in self.mem: return
         self.mem[k] = v
         if self.path:
-            with open(self.path, "a") as f:
+            with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"k": k, "v": v}) + "\n")
 
 class SemanticReward:
-    def __init__(self, cfg: Dict[str,Any]):
-        dev = "mps" if cfg.get("device","auto")=="auto" and torch.backends.mps.is_available() else cfg.get("device","cpu")
-        self.device = dev
-        self.model = SentenceTransformer(cfg["model"], device=self.device)
-        self.normalize = bool(cfg.get("normalize", True))
-        self.rescale01 = bool(cfg.get("rescale01", True))
-        self.length_clip = int(cfg.get("length_clip", 512))
-        self.cache = EmbCache(cfg.get("cache_path"))
+    """Reward = semantic similarity between response and reference."""
 
-    def _prep(self, s: str) -> str:
-        if self.length_clip and len(s) > self.length_clip:
-            return s[:self.length_clip]
-        return s
+    def __init__(self, cfg: Dict[str, Any]):
+        if torch.cuda.is_available(): self.device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): self.device = "mps"
+        else: self.device = "cpu"
 
-    def _embed(self, texts: List[str]) -> torch.Tensor:
-        # cache-aware embedding
-        batch, misses, miss_idx = [], [], []
-        vecs = [None]*len(texts)
-        for i,t in enumerate(texts):
-            t = self._prep(t)
-            k = _hash(t)
-            if self.cache and (v := self.cache.get(k)) is not None:
-                vecs[i] = torch.tensor(v, device=self.device, dtype=torch.float32)
-            else:
-                batch.append(t); misses.append(k); miss_idx.append(i)
-        if batch:
-            em = self.model.encode(batch, convert_to_tensor=True, device=self.device, normalize_embeddings=False)
-            for k, i, v in zip(misses, miss_idx, em):
-                if self.normalize:
-                    v = F.normalize(v.unsqueeze(0), p=2, dim=1).squeeze(0)
+        assert SentenceTransformer is not None, "Please `pip install sentence-transformers`."
+        self.model_id = cfg.get("model", "sentence-transformers/all-MiniLM-L6-v2")
+        self.model    = SentenceTransformer(self.model_id, device=self.device)
+        self.cache    = EmbCache(cfg.get("cache_path"))
+
+        self.encode_bs = int(cfg.get("encode_batch_size", 256))
+        self.normalize_vec = bool(cfg.get("normalize_vec", True))
+        self.rescale01     = bool(cfg.get("rescale01", True))
+        self.gamma_sem     = float(cfg.get("shaping", {}).get("gamma_sem", 1.5))
+
+        n0 = 0
+        if self.cache and self.cache.path and os.path.exists(self.cache.path):
+            n0 = sum(1 for _ in open(self.cache.path, "r", encoding="utf-8"))
+        # tlog(f"SemanticReward ready. device={self.device} encode_bs={self.encode_bs} cache='{self.cache.path}' lines={n0}")
+
+
+    def __call__(self, responses, references, **kw):
+        return self.score(responses, references)
+
+    def _embed_batch(self, texts: List[str], cache_refs: bool) -> torch.Tensor:
+        # cache_refs=True 表示是 reference，允许读/写 cache；False 表示 response，不写 cache
+        vecs, batch_texts, miss_keys, miss_idx = [None]*len(texts), [], [], []
+        for i, t in enumerate(texts):
+            s = (t or "").strip()
+            k = _hash16(s)
+            if cache_refs and self.cache:
+                v = self.cache.get(k)
+                if v is not None:
+                    vecs[i] = torch.tensor(v, device=self.device, dtype=torch.float32)
+                    continue
+            batch_texts.append(s); miss_keys.append(k); miss_idx.append(i)
+
+        if batch_texts:
+            em = self.model.encode(batch_texts, convert_to_tensor=True,
+                                device=self.device, normalize_embeddings=False)
+            for k, i, v in zip(miss_keys, miss_idx, em):
                 vecs[i] = v
-                if self.cache:
+                if cache_refs and self.cache:
                     self.cache.put(k, v.detach().cpu().tolist())
-        # stack
+
         emt = torch.stack(vecs, dim=0)
-        if self.normalize:
+        if self.normalize_vec:
             emt = F.normalize(emt, p=2, dim=1)
         return emt
 
     def score(self, responses: List[str], references: List[str]) -> List[float]:
-        assert len(responses)==len(references)
-        R = self._embed(responses)
-        G = self._embed(references)
-        cos = (R*G).sum(dim=1)  # cosine if normalized
-        if not self.normalize:
-            cos = F.cosine_similarity(R, G, dim=1)
-        if self.rescale01:
-            cos = 0.5*(cos + 1.0)
-        # clamp numeric noise
-        cos = torch.clamp(cos, 0.0, 1.0)
-        return [float(x) for x in cos.detach().cpu()]
+        assert len(responses) == len(references)
+        R = self._embed_batch(responses, cache_refs=False)   # 不写 cache
+        G = self._embed_batch(references, cache_refs=True)   # 参考写 cache
+        sim = (R * G).sum(dim=1)  # 归一化后内积=cos
+        if not self.rescale01:
+            pass
+        else:
+            sim = 0.5 * (sim + 1.0)
+        sim = (sim - EMPTY_BASELINE) / (1 - EMPTY_BASELINE)
+        if self.gamma_sem != 1.0:
+            sim = sim.clamp(0.0, 1.0).pow(self.gamma_sem)
+        return [float(x) for x in sim.clamp(0.0, 1.0).detach().cpu()]
+
+__all__ = ["SemanticReward"]

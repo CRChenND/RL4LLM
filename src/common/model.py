@@ -39,6 +39,7 @@ def load_model_and_tokenizer(model_id: str, device: str, dtype: str, lora_cfg: d
         model_id,
         torch_dtype=torch_dtype,
         device_map={"": device},
+        attn_implementation="eager",
         **auth_kwargs
     )
 

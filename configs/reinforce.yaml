@@ -1,11 +1,48 @@
-inherit: "configs/base.yaml"
+model_id: "google/gemma-3-4b-it"
+dtype: "float32"
+device: "cuda"
+seed: 42
 
-learning_rate: 1.5e-5
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.05
+  target_modules: ["q_proj","k_proj","v_proj","o_proj"]
+
+max_input_length: 384
+max_new_tokens: 12
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 16
+grad_accum: 8
+top_p: 0.8
+temperature_train: 0.5
+
+output_dir: "outputs"
+log_every: 10
+save_every: 50
+
+dataset:
+  path: "data/train/qa_train_clean.jsonl"
+  eval_path: "data/train/qa_eval_clean.jsonl"
+  template: "You are given a context and a question. Answer concisely using only information supported by the context. Answer with a single word or short phrase, no extra options or explanations.\n\nQ: {prompt}\nA:"
+  max_samples: null
+
+semantic_reward:
+  model: sentence-transformers/all-MiniLM-L6-v2
+  cache_path: "outputs/emb_cache.jsonl"
+  encode_batch_size: 64                  
+  normalize_vec: true
+  rescale01: true
+  shaping:
+    gamma_sem: 1.0
+
+learning_rate: 2e-5
 total_steps: 300
 
-reward:
-  type: "semantic"   # or "judge"/"mix"
-
 kl_penalty:
-  alpha: 0.01        # raise to keep policy closer; lower to let it drift
-  type: "token"      # "token" (fast) or "forward" (exact, slower)
+  adapt: true
+  alpha: 0.03  
+  target_low: 0.02
+  target_high: 0.10
+
+ent_coef: 0.01
