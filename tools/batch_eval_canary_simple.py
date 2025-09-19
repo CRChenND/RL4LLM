@@ -107,33 +107,6 @@ def bootstrap_mean_ci(x: List[float], iters: int = 10000, seed: int = 7, ci: flo
     lo = boots[int((1-ci)/2*(iters-1))]; hi = boots[int((1+(ci))/2*(iters-1))]
     return sum(boots)/iters, (lo, hi)
 
-# def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: str) -> Tuple[float, float, int]:
-#     """Return (sum_logprob, avg_logprob, cont_len_tokens) for the canary only."""
-#     full_text = prompt + continuation
-#     enc_full = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
-#     input_ids = enc_full["input_ids"].to(device)
-#     attn = enc_full.get("attention_mask", None)
-#     if attn is not None: attn = attn.to(device)
-
-#     enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-#     prompt_len = enc_prompt["input_ids"].shape[1]
-
-#     with torch.no_grad():
-#         out = model(input_ids=input_ids, attention_mask=attn)
-#         logits = out.logits[:, :-1, :].float()       # [1, T-1, V]
-#         targets = input_ids[:, 1:]                   # [1, T-1]
-#         log_probs = F.log_softmax(logits, dim=-1)    # [1, T-1, V]
-#         token_lp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [1, T-1]
-
-#     if prompt_len - 1 >= token_lp.shape[1]:
-#         return float("-inf"), float("-inf"), 0
-
-#     cont_lp = token_lp[0, prompt_len-1:].tolist()
-#     s = float(sum(cont_lp))
-#     L = len(cont_lp)
-#     a = s / max(1, L)
-#     return s, a, L
-
 def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: str) -> Tuple[float, float, int]:
     """
     只对 continuation (canary) 段计算对数似然：
@@ -181,7 +154,7 @@ def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: st
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
         # transformers 的 CausalLM 会返回 loss；我们要逐 token loss 来取对数似然
-        logits = out.logits  # [1, T, V]
+        logits = out.logits.float()  # [1, T, V]
         V = logits.shape[-1]
         # 计算逐 token 交叉熵（忽略 label=-100 的位置）
         per_token_nll = F.cross_entropy(
