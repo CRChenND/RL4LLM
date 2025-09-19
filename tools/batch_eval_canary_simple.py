@@ -6,6 +6,8 @@ from typing import List, Dict, Optional, Tuple
 from tqdm import tqdm
 
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True   # 提升稳定与速度
+torch.set_float32_matmul_precision("high")     # PyTorch 2.x
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
