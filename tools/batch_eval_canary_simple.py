@@ -36,7 +36,7 @@ def ensure_pad_token(tokenizer):
 def load_model_and_tokenizer(model_id: str, adapter_dir: Optional[str], device: str, dtype):
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     ensure_pad_token(tok)
-    base = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, device_map={"": device})
+    base = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map={"": device})
     if adapter_dir and adapter_dir.lower() != "none":
         if adapter_dir.endswith("adapter_model.safetensors"):
             adapter_dir = os.path.dirname(adapter_dir)
@@ -151,6 +151,9 @@ def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: st
     a = s / Lc
     return s, a, Lc
 
+def tok_len_no_special(tk, text: str) -> int:
+    # 始终返回 token 数（不加特殊符号）
+    return len(tk.encode(text, add_special_tokens=False))
 
 
 # ------------------------------
@@ -175,9 +178,12 @@ def eval_file_on_run(
 
         ll_sum, ll_avg, len_canary = continuation_ll(model, tokenizer, prompt, canary, device)
         if not math.isfinite(ll_avg) or len_canary == 0:
-            print("[DROP]", ex_id, bucket, "LpLc=", 
-                len(tokenizer(prompt, add_special_tokens=False)["input_ids"][0]),
-                len(tokenizer(canary, add_special_tokens=False)["input_ids"][0]))
+            print(
+                "[DROP]", ex_id, bucket,
+                "LpLc=",
+                tok_len_no_special(tokenizer, prompt),
+                tok_len_no_special(tokenizer, canary),
+            )
 
         out_rows.append({
             "run": run_name,
