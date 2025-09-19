@@ -109,44 +109,48 @@ def bootstrap_mean_ci(x: List[float], iters: int = 10000, seed: int = 7, ci: flo
 
 def continuation_ll(model, tokenizer, prompt: str, continuation: str, device: str):
     """
-    对 canary 段（续写）计算对数似然：
-    - 全程不加 special tokens，保证拼接后一致分词
-    - 明确做下一词预测的 1-token shift
-    - 在 FP32 上做 log_softmax，避免 FP16 数值不稳
-    返回 (sum_logprob, avg_logprob, cont_len_tokens)
+    对 canary 段计算对数似然（下一词预测）：
+    - 分别分词（add_special_tokens=False），再直接拼接 token 序列，避免重编码差异
+    - 显式做 1-token shift：logits[:, :-1] 预测 targets[:, 1:]
+    - 在 FP32 上算 log_softmax，防止半精度数值不稳
+    返回: (sum_logprob, avg_logprob, cont_len_tokens)
     """
-    # 分别分词，禁止 special tokens，拿到精准的 canary token 数
-    enc_prompt = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-    enc_canary = tokenizer(continuation, return_tensors="pt", add_special_tokens=False)
-    Lc = enc_canary["input_ids"].shape[1]
+    # 1) 分别分词（不加 special tokens）
+    enc_p = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    enc_c = tokenizer(continuation, return_tensors="pt", add_special_tokens=False)
+
+    ids_p = enc_p["input_ids"]
+    ids_c = enc_c["input_ids"]
+    Lp = ids_p.shape[1]
+    Lc = ids_c.shape[1]
+
     if Lc == 0:
         return float("-inf"), float("-inf"), 0
 
-    # 拼接后再次编码（同样不加 special tokens，确保可控长度）
-    enc_full = tokenizer(prompt + continuation, return_tensors="pt", add_special_tokens=False)
-    input_ids = enc_full["input_ids"].to(device)           # [1, T]
-    attn = enc_full.get("attention_mask", None)
-    if attn is not None: attn = attn.to(device)
+    # 2) 直接按 token 级别拼接（避免重编码引入的规范化差异）
+    input_ids = torch.cat([ids_p, ids_c], dim=1).to(device)  # [1, Lp+Lc]
+    attn = torch.ones_like(input_ids, device=device)         # 简单全 1 掩码
+
     T = input_ids.shape[1]
-    if T < 2 or Lc >= T:
+    if T < 2:  # 太短就放弃
         return float("-inf"), float("-inf"), 0
 
+    # 3) 前向 + 1-token shift
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attn)
-        # 下一词预测：logits 取到倒数第二，targets 从第二个开始
-        logits = out.logits[:, :-1, :].float()             # [1, T-1, V]  转 FP32 更稳
-        targets = input_ids[:, 1:]                         # [1, T-1]
-        # 只取“最后 Lc 个 target”（也就是 canary 的 token）
+        logits = out.logits[:, :-1, :].float()       # [1, T-1, V]  用 FP32
+        targets = input_ids[:, 1:]                   # [1, T-1]
+
+        # 只取最后 Lc 个 target（就是 canary 的位置）
         V = logits.shape[-1]
-        log_probs = F.log_softmax(logits, dim=-1)          # FP32
-        canary_targets = targets[:, -Lc:]                  # [1, Lc]
-        canary_lp = log_probs[:, -Lc:, :].gather(          # [1, Lc, V] -> [1, Lc]
-            -1, canary_targets.unsqueeze(-1)
-        ).squeeze(-1)
+        log_probs = F.log_softmax(logits, dim=-1)    # FP32
+        canary_targets = targets[:, -Lc:]            # [1, Lc]
+        canary_lp = log_probs[:, -Lc:, :].gather(-1, canary_targets.unsqueeze(-1)).squeeze(-1)  # [1, Lc]
 
     s = float(canary_lp.sum().item())
     a = s / Lc
     return s, a, Lc
+
 
 
 # ------------------------------
@@ -170,6 +174,10 @@ def eval_file_on_run(
         canary  = ex.get("canary", "")
 
         ll_sum, ll_avg, len_canary = continuation_ll(model, tokenizer, prompt, canary, device)
+        if not math.isfinite(ll_avg) or len_canary == 0:
+            print("[DROP]", ex_id, bucket, "LpLc=", 
+                len(tokenizer(prompt, add_special_tokens=False)["input_ids"][0]),
+                len(tokenizer(canary, add_special_tokens=False)["input_ids"][0]))
 
         out_rows.append({
             "run": run_name,
